@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+node_modules/
+dist/
+.vite/
+mysql_data/
+*.egg-info/
+.venv/
+venv/
+.DS_Store
+*.tsbuildinfo

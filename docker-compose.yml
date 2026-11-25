@@ -1,0 +1,139 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    # On a fresh database the backend's startup waits (retrying in-process)
+    # until `alembic upgrade head` has created the schema; the restart policy
+    # additionally covers hard crashes.
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - APP_ENV=development
+    volumes:
+      - ./backend:/app
+      - repo_clones:/data/repos
+      # Local-file resources must be visible inside the container. The
+      # sample notes ship mounted at /data/sample_resources; add your own
+      # notes directory here the same way.
+      - ./sample_resources:/data/sample_resources:ro
+      # File-picker uploads land here; shared so the worker can ingest them.
+      - uploads:/data/uploads
+      # SecretStore's generated AES key; shared so the worker can decrypt.
+      - secrets:/data/secrets
+      # Your Google sign-in (ADC), read-only, where the SDK looks for it.
+      # Until GCLOUD_CONFIG_DIR is set in .env, an empty folder stands in.
+      - ${GCLOUD_CONFIG_DIR:-./.gcloud-not-set-up}:/root/.config/gcloud:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - copilot_network
+    command: uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+  # RQ worker — executes agent runs and resource-ingestion jobs enqueued by
+  # the backend. Shares the backend image and codebase.
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - APP_ENV=development
+    volumes:
+      - ./backend:/app
+      - repo_clones:/data/repos
+      - ./sample_resources:/data/sample_resources:ro
+      - uploads:/data/uploads
+      # SecretStore's generated AES key; shared so the worker can decrypt.
+      - secrets:/data/secrets
+      # Your Google sign-in (ADC), read-only, where the SDK looks for it.
+      # Until GCLOUD_CONFIG_DIR is set in .env, an empty folder stands in.
+      - ${GCLOUD_CONFIG_DIR:-./.gcloud-not-set-up}:/root/.config/gcloud:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - copilot_network
+    command: rq worker agents ingestion --url redis://redis:6379/0
+
+  frontend:
+    image: node:20-slim
+    working_dir: /app
+    ports:
+      - "5173:5173"
+    environment:
+      - BACKEND_ORIGIN=http://backend:8000
+    volumes:
+      - ./frontend:/app
+    networks:
+      - copilot_network
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+
+  # Mock LLM (optional): a controllable stand-in for Vertex AI, for keyless
+  # development and deterministic testing — see mock_llm/main.py. Start with
+  #   docker compose --profile mock up
+  # and set LLM_BASE_URL=http://mock-llm:9000 in .env to route to it.
+  mock-llm:
+    build:
+      context: ./mock_llm
+      dockerfile: Dockerfile
+    profiles: ["mock"]
+    ports:
+      - "9000:9000"
+    networks:
+      - copilot_network
+
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: copilot
+      MYSQL_USER: app_user
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - copilot_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "app_user", "-p${MYSQL_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 45s
+
+  redis:
+    image: redis:7.0-alpine
+    networks:
+      - copilot_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Redis is the agent job queue/broker here (via RQ) — NOT a cache or
+    # session store. Persistence matters: queued agent runs should survive
+    # a container restart.
+    command: redis-server --appendonly yes --appendfsync everysec
+
+volumes:
+  mysql_data:
+  repo_clones:
+  uploads:
+  secrets:
+
+networks:
+  copilot_network:
+    driver: bridge
